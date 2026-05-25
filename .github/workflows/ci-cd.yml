@@ -1,0 +1,429 @@
+# Staged CI/CD: Build → Security → Test → DAST → Quality gate (Sonar) → Deploy simulation
+# See docs/CI_CD_PIPELINE.md for stage and tool documentation.
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-cd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1 — Build
+  # ---------------------------------------------------------------------------
+  build:
+    name: "1 · Build"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Backend build (bytecode compile)
+        run: python -m compileall -q backend/app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Write build metadata
+        run: |
+          echo "GITHUB_SHA=${{ github.sha }}" > build-metadata.txt
+          echo "GITHUB_REF=${{ github.ref }}" >> build-metadata.txt
+          date -u "+%Y-%m-%dT%H:%M:%SZ" >> build-metadata.txt
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.txt
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 — Security scans (static / supply chain / image)
+  # ---------------------------------------------------------------------------
+  security-bandit:
+    name: "2 · Security — Bandit"
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Bandit
+        run: pip install "bandit[toml]==1.7.10"
+
+      - name: Run Bandit (SARIF)
+        id: bandit
+        continue-on-error: true
+        run: bandit -r backend/app -ll -ii -x backend/tests -f sarif -o bandit-report.sarif
+
+      - name: Upload Bandit SARIF
+        if: always() && steps.bandit.conclusion != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-bandit
+          path: bandit-report.sarif
+
+      - name: Enforce Bandit (block on findings)
+        if: steps.bandit.conclusion == 'failure'
+        run: exit 1
+
+  security-trivy-fs:
+    name: "2 · Security — Trivy (filesystem)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          trivyignores: ""
+          exit-code: "0"
+          skip-dirs: "frontend/node_modules,.git"
+
+      - name: Trivy filesystem (table, human-readable)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          output: trivy-fs-table.txt
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          skip-dirs: "frontend/node_modules,.git"
+
+      - name: Upload Trivy FS reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-trivy-fs
+          path: |
+            trivy-fs.sarif
+            trivy-fs-table.txt
+
+  security-trivy-image:
+    name: "2 · Security — Trivy (backend image)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (CI tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false
+          load: true
+          tags: psc-backend:ci
+
+      - name: Trivy image scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: psc-backend:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Trivy image scan (table)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: psc-backend:ci
+          format: table
+          output: trivy-image-table.txt
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Upload Trivy image reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-trivy-image
+          path: |
+            trivy-image.sarif
+            trivy-image-table.txt
+
+  security-pip-audit:
+    name: "2 · Security — pip-audit"
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit (JSON + text)
+        working-directory: backend
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format json --output pip-audit.json || true
+          pip-audit -r requirements.txt --desc on 2>&1 | tee pip-audit.txt || true
+
+      - name: Upload pip-audit reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-pip-audit
+          path: |
+            backend/pip-audit.json
+            backend/pip-audit.txt
+
+  # ---------------------------------------------------------------------------
+  # Stage 3 — Test
+  # ---------------------------------------------------------------------------
+  test-backend:
+    name: "3 · Test — Backend (pytest + coverage + JUnit)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Pytest (full suite incl. @pytest.mark.security + coverage + JUnit)
+        run: pytest -q --junitxml=junit.xml
+
+      - name: Upload backend test & coverage reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-backend-reports
+          path: |
+            backend/coverage.xml
+            backend/junit.xml
+
+  test-frontend:
+    name: "3 · Test — Frontend (Vitest + coverage)"
+    runs-on: ubuntu-latest
+    needs: [build]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Vitest with coverage
+        run: npm run test:coverage
+
+      - name: Upload frontend coverage (LCOV + HTML)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-frontend-coverage
+          path: frontend/coverage/
+
+  # ---------------------------------------------------------------------------
+  # Stage 2/4 — DAST: start API + OWASP ZAP baseline
+  # ---------------------------------------------------------------------------
+  dast-zap:
+    name: "4 · DAST — OWASP ZAP baseline"
+    runs-on: ubuntu-latest
+    needs: [build, test-backend]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start API (SQLite, CI secrets)
+        working-directory: backend
+        env:
+          SECRET_KEY: ci-secret-key-for-testing-only-32chars-minimum
+          JWT_SECRET_KEY: ci-jwt-secret-key-testing-only-32chars-min
+          VAULT_KDF_PEPPER: ci-vault-pepper-32-characters-minimum!!
+          DATABASE_URI: sqlite:////tmp/psc_ci.sqlite
+          AUTO_DB_CREATE_ALL: "1"
+          BOOTSTRAP_ADMIN_USERNAME: ""
+        run: |
+          mkdir -p "${{ github.workspace }}/zap-reports"
+          nohup python run.py > "${{ github.workspace }}/zap-reports/api.log" 2>&1 &
+          for i in $(seq 1 45); do
+            if curl -fsS "http://127.0.0.1:5000/api/v1/health" >/dev/null 2>&1; then
+              echo "API ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"
+          tail -n 200 "${{ github.workspace }}/zap-reports/api.log" || true
+          exit 1
+
+      - name: OWASP ZAP baseline (reports + relaxed exit)
+        run: |
+          docker run --network host \
+            -v "${{ github.workspace }}/zap-reports:/zap/wrk/:rw" \
+            --rm ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+              -t http://127.0.0.1:5000 \
+              -r /zap/wrk/zap-report.html \
+              -J /zap/wrk/zap-report.json \
+              -w /zap/wrk/zap-report.md \
+              -I || true
+
+      - name: Upload ZAP DAST reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dast-zap-reports
+          path: zap-reports/
+
+  # ---------------------------------------------------------------------------
+  # SonarCloud / SonarQube (quality gate; optional token)
+  # ---------------------------------------------------------------------------
+  sonarcloud:
+    name: "Quality — SonarCloud"
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend, build]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download backend coverage & JUnit
+        uses: actions/download-artifact@v4
+        with:
+          name: test-backend-reports
+          path: .
+
+      - name: Download frontend LCOV / coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: test-frontend-coverage
+          path: frontend/coverage
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarqube-scan-action@v5.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 4 — Deployment simulation
+  # ---------------------------------------------------------------------------
+  deploy-simulation:
+    name: "4 · Deploy (simulation)"
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - test-backend
+      - test-frontend
+      - security-bandit
+      - security-trivy-fs
+      - security-trivy-image
+      - security-pip-audit
+      - dast-zap
+      - sonarcloud
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: deploy-sim/dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          path: deploy-sim/
+
+      - name: Simulate release / deploy
+        run: |
+          set -eux
+          echo "=== Deployment simulation ==="
+          echo "Environment: GitHub Actions (no production credentials used)"
+          echo "Would: docker build & push backend/frontend images to GHCR"
+          echo "Would: update Kubernetes Deployment / ECS service / Cloud Run revision"
+          echo "Would: run smoke tests against staging URL"
+          echo ""
+          echo "--- Packaged static assets (from build) ---"
+          du -sh deploy-sim/dist || true
+          find deploy-sim/dist -type f | head -20 || true
+          echo ""
+          echo "--- Build metadata ---"
+          cat deploy-sim/build-metadata.txt || true
+          echo ""
+          echo "Simulation complete. Replace this job with real deploy steps when ready."
+
+      - name: Upload deploy simulation bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-simulation-bundle
+          path: deploy-sim/

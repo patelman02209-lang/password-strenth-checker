@@ -1,0 +1,78 @@
+@import 'tailwindcss';
+
+:root {
+  --psc-bg: #020617;
+  --psc-neon: #34d399;
+  --psc-neon2: #22d3ee;
+  --psc-focus: rgba(52, 211, 153, 0.45);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--psc-bg);
+  color: #e4e4e7;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(52, 211, 153, 0.35);
+  color: #fafafa;
+}
+
+/* Focus visibility for keyboard users (components also use Tailwind focus-visible). */
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--psc-focus);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Subtle scrollbars in WebKit */
+* {
+  scrollbar-color: rgba(63, 63, 70, 0.6) transparent;
+  scrollbar-width: thin;
+}
+
+.psc-glass {
+  background: linear-gradient(145deg, rgba(24, 24, 27, 0.82), rgba(9, 9, 11, 0.72));
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+html[data-theme='light'] {
+  --psc-bg: #f1f5f9;
+  --psc-focus: rgba(5, 150, 105, 0.45);
+}
+
+html[data-theme='light'] body {
+  color: #27272a;
+}
+
+html[data-theme='light'] .psc-glass {
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.94), rgba(244, 244, 245, 0.88));
+}
+
+html[data-theme='light'] .workspace-header {
+  background: rgba(255, 255, 255, 0.88);
+  border-color: rgba(228, 228, 231, 0.95);
+  color: #18181b;
+}
